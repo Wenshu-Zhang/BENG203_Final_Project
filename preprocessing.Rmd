@@ -1,0 +1,133 @@
+---
+title: "BENG203"
+author: "Jiaming Weng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Ensure BiocManager is installed if you haven't used it before:
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(c("biomaRt", "readr", "dplyr", "EnsDb.Hsapiens.v79")) # Or latest EnsDb
+```
+
+## Dependencies and data loading
+
+```{r}
+library(tidyverse)
+library(biomaRt)
+
+AMP <- c("PBXIP1", "MID1IP1", "SLC25A18", "GFAP", "GNA12", "CRTAP", "QDPR", "GPRC5B", "PADI2", "NACC2", "RHOQ", "QKI", "CSRP1", "CALD1", "SASH1", "TNS3", "LAMP2", "ERBB2IP", "FAM107A", "PLXNB1", "AHNAK", "MYO10", "PDE4DIP", "ITPKB", "KCNJ10", "DOCK1", "MRAS", "PHGDH")
+DEG <- c("ENSG00000087085", "ENSG00000130203", "ENSG00000091831", "ENSG00000142192", "ENSG00000147571", "ENSG00000137642", "ENSG00000125538", "ENSG00000036530", "ENSG00000197943", "ENSG00000120885", "ENSG00000166340", "ENSG00000174697", "ENSG00000232810", "ENSG00000116133", "ENSG00000152234", "ENSG00000100197", "ENSG00000254647", "ENSG00000087088", "ENSG00000180210", "ENSG00000132170")
+counts_df <- read.csv("./toden_counts.txt", sep = "\t", header = TRUE, row.names = 1)
+```
+
+## Get ENSG
+```{r}
+ensembl_mart <- useEnsembl(biomart = "genes", 
+                      dataset = "hsapiens_gene_ensembl")
+AMP_conversion <- getBM(attributes = c('hgnc_symbol', 'ensembl_gene_id'),
+                        filters = 'hgnc_symbol',
+                        values = AMP,
+                        mart = ensembl)
+```
+
+```{r}
+all_features_of_interest <- unique(c(DEG, AMP_conversion$ensembl_gene_id))
+print(paste("Total unique features of interest (Ensembl IDs + Transposons):", length(all_features_of_interest)))
+features_in_counts <- intersect(all_features_of_interest, rownames(counts_df))
+length(features_in_counts)
+```
+
+## gene length
+- average gene length
+```{r}
+mart <- useEnsembl("ensembl")
+
+## using the US West mirror
+us_mart <- useEnsembl(biomart = "ensembl", mirror = "asia",  dataset = "hsapiens_gene_ensembl")
+
+gene_annotations <- getBM(
+    attributes = c("ensembl_gene_id", "transcript_length", "chromosome_name"),
+    filters    = "ensembl_gene_id",
+    values     = rownames(counts_df),
+    mart = us_mart
+  )
+
+gene_lengths_processed <- gene_annotations %>%
+  filter(!is.na(transcript_length), transcript_length > 0, # Ensure valid lengths
+         chromosome_name %in% c(as.character(1:22), "X", "Y", "MT")) %>% # Optional: filter for standard chromosomes
+  group_by(ensembl_gene_id) %>% # Group by gene
+  summarise(
+    length = median(transcript_length, na.rm = TRUE), # Calculate median length
+    .groups = 'drop' # Ungroup after summarising
+  ) %>%
+  mutate(length = as.integer(length)) # Ensure integer length
+
+
+counts_final <- counts_df[rownames(counts_df) %in% gene_annotations$ensembl_gene_id, ]
+gene_lengths_bp_vector <- gene_lengths_processed$length[match(rownames(counts_final), gene_lengths_processed$ensembl_gene_id)]
+```
+
+## TPM
+```{r}
+rpkm_matrix <- edgeR::rpkm(counts_final, gene.length = gene_lengths_bp_vector, log = FALSE)
+
+# Convert RPKM to TPM: TPM = (RPKM_gene / sum_of_RPKMs_for_sample) * 1e6
+tpm_matrix <- apply(rpkm_matrix, 2, function(sample_rpkm_col) {
+  sum_rpkm_sample <- sum(sample_rpkm_col, na.rm = TRUE)
+  if (sum_rpkm_sample == 0 || is.na(sum_rpkm_sample) || !is.finite(sum_rpkm_sample)) {
+    return(rep(0, length(sample_rpkm_col)))
+  }
+  (sample_rpkm_col / sum_rpkm_sample) * 1e6
+})
+
+# Ensure tpm_matrix is a data frame with correct row/column names
+tpm_matrix <- as.data.frame(tpm_matrix)
+if(ncol(tpm_matrix) > 0 && nrow(tpm_matrix) > 0) { # Check if tpm_matrix has columns/rows
+    colnames(tpm_matrix) <- colnames(counts_final)
+    rownames(tpm_matrix) <- rownames(counts_final)
+} else if (nrow(tpm_matrix) > 0) { # If only rows, but no columns (e.g. 1 sample)
+    rownames(tpm_matrix) <- rownames(counts_final)
+    # colnames will be preserved if counts_final had them
+}
+write.table(tpm_matrix ,
+              file = "tpm_matrix.tsv",
+              sep = "\t",
+              quote = FALSE,
+              row.names = TRUE,
+              col.names = NA)
+```
+
+- log
+```{r}
+log2_tpm_matrix <- log2(tpm_matrix + 1)
+write.table(log2_tpm_matrix ,
+              file = "log2_tpm_matrix.tsv",
+              sep = "\t",
+              quote = FALSE,
+              row.names = TRUE,
+              col.names = NA)
+```
+
+## Subset for features of interest
+```{r}
+tpm_matrix_subset <- tpm_matrix[features_in_counts, ]
+log2_tpm_matrix_subset <- log2_tpm_matrix[features_in_counts, ]
+write.table(tpm_matrix_subset ,
+              file = "tpm_matrix_subset.tsv",
+              sep = "\t",
+              quote = FALSE,
+              row.names = TRUE,
+              col.names = NA)
+write.table(log2_tpm_matrix_subset ,
+              file = "log2_tpm_matrix_subset.tsv",
+              sep = "\t",
+              quote = FALSE,
+              row.names = TRUE,
+              col.names = NA)
+```
+
+
